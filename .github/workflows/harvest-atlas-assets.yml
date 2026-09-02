@@ -1,0 +1,159 @@
+name: Harvest Atlas Assets
+
+on:
+  push:
+    branches:
+      - asset-harvest-20260902
+
+permissions:
+  contents: read
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install harvest dependencies
+        run: pip install requests beautifulsoup4 pillow
+
+      - name: Harvest all referenced images
+        shell: bash
+        run: |
+          cat > /tmp/harvest.py <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, html, json, mimetypes, os, re, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, unquote
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+
+          ROOT = Path.cwd()
+          OUT = ROOT / 'harvested'
+          IMG = OUT / 'images'
+          HTML = OUT / 'html'
+          IMG.mkdir(parents=True, exist_ok=True)
+          HTML.mkdir(parents=True, exist_ok=True)
+
+          for p in ROOT.glob('*.html'):
+              shutil.copy2(p, HTML / p.name)
+          for extra in ('README.md', 'COVERAGE_REPORT.md', 'CRITIQUE.md'):
+              p = ROOT / extra
+              if p.exists(): shutil.copy2(p, OUT / p.name)
+
+          sess = requests.Session()
+          sess.headers.update({
+              'User-Agent': 'Mozilla/5.0 (compatible; private educational atlas asset audit/1.0)',
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              'Referer': 'https://github.com/FadiBahodi/fracture-atlas'
+          })
+
+          image_exts = {'.jpg','.jpeg','.png','.gif','.webp','.svg','.tif','.tiff','.bmp'}
+          url_re = re.compile(r'https?://[^\s"\'<>\\]+', re.I)
+          css_url_re = re.compile(r'url\(["\']?(https?://[^)"\']+)', re.I)
+          attrs = ('src','data-src','data-full','data-full-url','data-image','href')
+          records=[]
+          seen={}
+
+          def clean_url(u:str)->str:
+              u=html.unescape(u).strip().strip('"\'(),;')
+              u=u.replace('\\/','/')
+              return u
+
+          def candidate(u:str)->bool:
+              if not u.startswith(('http://','https://')): return False
+              lo=u.lower().split('?',1)[0]
+              if any(lo.endswith(x) for x in image_exts): return True
+              return any(k in lo for k in ('image','figure','radiograph','xray','x-ray','radiopaedia','wikimedia','eurorad','pacs.de','orthobullets','radiologyassistant'))
+
+          def ext_for(url, ctype):
+              ext=Path(unquote(urlparse(url).path)).suffix.lower()
+              if ext in image_exts: return '.jpg' if ext=='.jpeg' else ext
+              c=(ctype or '').split(';')[0].strip().lower()
+              return { 'image/jpeg':'.jpg','image/png':'.png','image/gif':'.gif','image/webp':'.webp','image/svg+xml':'.svg','image/tiff':'.tif','image/bmp':'.bmp' }.get(c,'.img')
+
+          html_files=sorted(ROOT.glob('*.html'))
+          for hi,p in enumerate(html_files,1):
+              raw=p.read_text('utf-8',errors='ignore')
+              soup=BeautifulSoup(raw,'html.parser')
+              found=[]
+              for tag in soup.find_all(True):
+                  for a in attrs:
+                      v=tag.get(a)
+                      if isinstance(v,str):
+                          v=clean_url(v)
+                          if candidate(v): found.append((v, tag.get('alt',''), a))
+              for m in url_re.findall(raw):
+                  u=clean_url(m)
+                  if candidate(u): found.append((u,'','raw'))
+              for m in css_url_re.findall(raw):
+                  u=clean_url(m)
+                  if candidate(u): found.append((u,'','css'))
+
+              local_seen=set()
+              for u,alt,origin in found:
+                  if u in local_seen: continue
+                  local_seen.add(u)
+                  key=hashlib.sha1(u.encode()).hexdigest()[:16]
+                  rec={'page':p.name,'title':soup.title.string.strip() if soup.title and soup.title.string else p.stem,
+                       'url':u,'alt':alt,'origin':origin,'status':'','http_status':'','content_type':'',
+                       'local_path':'','width':'','height':'','bytes':'','error':''}
+                  if u in seen:
+                      rec.update(seen[u]); records.append(rec); continue
+                  try:
+                      r=sess.get(u,timeout=25,allow_redirects=True)
+                      rec['http_status']=r.status_code
+                      rec['content_type']=r.headers.get('content-type','')
+                      if r.status_code!=200 or not r.content:
+                          raise RuntimeError(f'HTTP {r.status_code}, {len(r.content)} bytes')
+                      ext=ext_for(r.url,rec['content_type'])
+                      dest=IMG/f'{key}{ext}'
+                      dest.write_bytes(r.content)
+                      rec['bytes']=len(r.content)
+                      rec['local_path']=str(dest.relative_to(OUT))
+                      rec['status']='downloaded'
+                      if ext!='.svg':
+                          try:
+                              with Image.open(dest) as im:
+                                  rec['width'],rec['height']=im.size
+                          except Exception as e:
+                              rec['error']=f'image-parse: {e}'
+                      seen[u]={k:rec[k] for k in ('status','http_status','content_type','local_path','width','height','bytes','error')}
+                  except Exception as e:
+                      rec['status']='failed'; rec['error']=repr(e)
+                      seen[u]={k:rec[k] for k in ('status','http_status','content_type','local_path','width','height','bytes','error')}
+                  records.append(rec)
+                  time.sleep(0.08)
+              print(f'[{hi}/{len(html_files)}] {p.name}: {len(local_seen)} image URLs')
+
+          fields=['page','title','url','alt','origin','status','http_status','content_type','local_path','width','height','bytes','error']
+          with (OUT/'manifest.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(records)
+          (OUT/'manifest.json').write_text(json.dumps(records,indent=2,ensure_ascii=False),encoding='utf-8')
+          summary={
+              'html_pages':len(html_files),
+              'references':len(records),
+              'unique_urls':len(seen),
+              'downloaded_unique':sum(1 for v in seen.values() if v['status']=='downloaded'),
+              'failed_unique':sum(1 for v in seen.values() if v['status']=='failed'),
+              'downloaded_bytes':sum(int(v.get('bytes') or 0) for v in seen.values() if v['status']=='downloaded')
+          }
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2))
+          PY
+          python /tmp/harvest.py
+
+      - name: Upload harvested atlas corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fracture-atlas-harvest
+          path: harvested/
+          retention-days: 3
+          compression-level: 6
