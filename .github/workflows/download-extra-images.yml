@@ -1,0 +1,79 @@
+name: Download Verified Extra Orthopedic Images
+
+on:
+  push:
+    branches:
+      - asset-harvest-20260902
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests pillow
+      - name: Download verified images
+        shell: bash
+        run: |
+          cat > /tmp/download.py <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlparse
+          import json, requests
+          from PIL import Image
+
+          items = [
+            ("distal_biceps_hook_test.jpg", "https://wikism.org/w/images/thumb/c/cd/Hook_test.jpg/1200px-Hook_test.jpg", "WikiSM", "Distal biceps Hook test"),
+            ("distal_biceps_mri.png", "https://www.mdpi.com/jcm/jcm-12-06423/article_deploy/html/images/jcm-12-06423-g001.png", "MDPI", "MRI of distal biceps tendon rupture"),
+            ("achilles_thompson_test.jpg", "https://www.lowerextremity.com/client-images/achilles-tear-thompson-test.jpg", "Lower Extremity Review", "Thompson test for Achilles rupture"),
+            ("extension_teardrop_xray.jpg", "https://www.learningradiology.com/caseofweek/caseoftheweekpix2012%20513-/cow515-1lg.jpg", "LearningRadiology", "Extension teardrop cervical fracture radiograph"),
+            ("extension_injury_ct.png", "https://img.auntminnie.com/files/base/smg/all/image/2020/12/am.2020_12_03_16_11_3286_2020_12_02_winter_sports_figure4_cropped.png?auto=format%2Ccompress&fit=max&q=70&w=1200", "AuntMinnie", "Cervical extension injury CT/MRI panel"),
+            ("ankylosed_spine_chalkstick.png", "https://static.wixstatic.com/media/e35976_7aed8da566574382b0a68588738b957d~mv2.png/v1/fill/w_980%2Ch_551%2Cal_c%2Cq_90%2Cusm_0.66_1.00_0.01%2Cenc_avif%2Cquality_auto/e35976_7aed8da566574382b0a68588738b957d~mv2.png", "Wix-hosted educational figure", "Chalk-stick fracture through ankylosed spine"),
+            ("ankylosed_spine_ct.jpg", "https://cdn.ncbi.nlm.nih.gov/pmc/blobs/1cab/9063196/cc39f8352932/12873_2022_635_Fig1_HTML.jpg", "PubMed Central", "CT of fracture in ankylosed spine"),
+            ("ankylosed_spine_extra.jpg", "https://www.polradiol.com/f/fulltexts/204202/PJR-90-204202-g003.jpg", "Polish Journal of Radiology", "Imaging of ankylosed-spine fracture"),
+            ("subtalar_dislocation.jpg", "https://media.springernature.com/lw1200/springer-static/image/art%3A10.1007%2Fs12245-009-0086-y/MediaObjects/12245_2009_86_Fig1_HTML.jpg", "Springer", "Subtalar dislocation radiograph"),
+            ("patellar_dislocation_skyline.jpg", "https://cdn.ncbi.nlm.nih.gov/pmc/blobs/07f7/11506652/614eeec895fd/children-11-01261-g001.jpg", "PubMed Central", "Patellar dislocation skyline radiograph"),
+            ("patellar_dislocation_aplat.jpg", "https://cdn.ncbi.nlm.nih.gov/pmc/blobs/263d/12180377/b28ab51a4133/cureus-0017-00000084539-i01.jpg", "PubMed Central", "Patellar dislocation AP and lateral radiographs"),
+            ("ra_atlantoaxial_flexext.png", "https://www.grayscalecourses.com/uploads/4/5/0/4/45041957/picture1_2_orig.png", "Grayscale Courses", "Rheumatoid atlantoaxial instability flexion-extension radiographs"),
+            ("ra_atlantoaxial_annotated.png", "https://www.mdpi.com/jcm/jcm-13-04441/article_deploy/html/images/jcm-13-04441-g001.png", "MDPI", "Annotated rheumatoid atlantoaxial instability imaging"),
+            ("subtalar_dislocation_alt.jpg", "https://www.kauveryhospital.com/wp-content/uploads/2025/04/ta2.jpg", "Kauvery Hospital", "Subtalar dislocation radiograph, alternate view")
+          ]
+
+          out = Path('extra_images')
+          out.mkdir(exist_ok=True)
+          s = requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 private educational image audit','Accept':'image/*,*/*;q=0.8'})
+          manifest=[]
+          for name,url,source,caption in items:
+              rec={'name':name,'url':url,'source':source,'caption':caption,'status':'','http_status':None,'content_type':'','width':None,'height':None,'bytes':0,'error':''}
+              try:
+                  r=s.get(url,timeout=35,allow_redirects=True)
+                  rec['http_status']=r.status_code
+                  rec['content_type']=r.headers.get('content-type','')
+                  r.raise_for_status()
+                  (out/name).write_bytes(r.content)
+                  rec['bytes']=len(r.content)
+                  with Image.open(out/name) as im:
+                      rec['width'],rec['height']=im.size
+                      im.verify()
+                  rec['status']='downloaded'
+              except Exception as e:
+                  rec['status']='failed'; rec['error']=repr(e)
+              manifest.append(rec)
+              print(name, rec['status'], rec['http_status'], rec['width'], rec['height'], rec['error'])
+          (out/'manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+          PY
+          python /tmp/download.py
+      - name: Upload extra images
+        uses: actions/upload-artifact@v4
+        with:
+          name: fracture-atlas-extra-images
+          path: extra_images/
+          retention-days: 3
+          compression-level: 6
